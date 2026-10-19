@@ -483,6 +483,7 @@ void HandleBacktrack()
         if (isJumping || !isGrounded) return;
 
         Debug.Log("Preparing to jump.");
+        Debug.Log("Preparing to jump.");
         isJumping = true;
         rb.linearVelocity = new Vector3(rb.linearVelocity.x, 0f, rb.linearVelocity.z); // reset Y first
         rb.AddForce(Vector3.up * jumpForce, ForceMode.Impulse);
