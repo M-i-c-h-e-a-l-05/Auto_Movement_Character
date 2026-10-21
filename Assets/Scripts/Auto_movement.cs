@@ -1,509 +1,1212 @@
 using System.Collections.Generic;
 using UnityEngine;
 
+[RequireComponent(typeof(Rigidbody), typeof(CapsuleCollider))]
 public class Auto_movement : MonoBehaviour
 {
+    private enum NavigationState
+    {
+        DirectMove,
+        MoveToWaypoint,
+        Backtrack
+    }
+
+    private class CellMemory
+    {
+        public int visits;
+        public int deadEnd;
+        public int proven;
+        public float y;
+    }
+
     [Header("Target")]
     public Transform target;
+    public float stoppingDistance = 0.5f;
 
     [Header("Movement")]
     public float moveSpeed = 5f;
-    public float rotateSpeed = 10f;
-    public float jumpForce = 7f;
-    public float stepDistance = 0.5f;
+    public float rotateSpeed = 14f;
 
-    [Header("Obstacle Rules")]
-    public float obstacleCheckDistance = 2f;
+    [Header("Smooth Movement")]
+    public float acceleration = 18f;
+    public float deceleration = 14f;
+    [Range(0f, 1f)] public float airControl = 0.8f;
+    [Range(0f, 1f)] public float minimumTurnSpeed = 0.35f;
+
+    [Tooltip("Higher = switches to the next waypoint earlier = smoother, wider turns.")]
+    public float lookAheadTime = 0.25f;
+
+    [Header("Memory")]
+    [Tooltip("How strongly the bot avoids revisited cells and prefers proven ones. 0 = no memory influence.")]
+    public float memoryStrength = 1.5f;
+    public float memoryCellSize = 1f;
+
+    [Header("Obstacle Detection")]
+    public float obstacleCheckDistance = 2.5f;
     public float maxJumpableHeight = 1.5f;
+    public float capsuleCastPadding = 0.05f;
+    public LayerMask obstacleMask = ~0;
 
     [Header("Ground Check")]
-    public float groundCheckDistance = 0.2f;
     public LayerMask groundLayer;
+    public float groundCheckDistance = 0.25f;
+    public float groundProbeHeight = 3f;
+    public float maximumGroundProbeDistance = 10f;
+    [Range(0f, 1f)] public float minimumGroundNormalY = 0.7f;
+    public float groundSampleStep = 0.5f;
 
-    [Header("Navigation / Backtracking")]
-    public float nodeSpacing = 1.5f;        
-    public float alternateCheckDistance = 2f;
-    public float alternateAngle = 45f;   
-    public float angleTestRotateSpeed = 3f;  
-    public float angleFacingTolerance = 5f;   
+    [Header("Jumping")]
+    public float jumpForce = 7f;
+    public float jumpForwardSpeed = 5f;
+    public float jumpForwardDuration = 0.45f;
+    public float jumpCooldown = 0.8f;
+    public float jumpLandingTimeout = 3f;
 
+    [Header("Temporary Goals")]
+    public float waypointDistance = 3f;
+    public float waypointReachedDistance = 0.6f;
+    public float waypointHeightTolerance = 1.5f;
 
-    private bool searchingAlternate = false;
-    private Vector3 searchBlockedDir;
-    private List<float> pendingAngles = new List<float>();
-    private float currentTestAngle;
-    private Vector3 currentTestDir;
-    private Vector3 activeAlternateDir = Vector3.zero;
-    private bool useAlternateDir = false;
+    [Header("Fast Decision Making")]
+    public float replanInterval = 0.12f;
+    public float waypointRecheckInterval = 0.2f;
+    public float stuckRecoveryCooldown = 0.5f;
 
-    private class PathNode
+    [Header("Recovery")]
+    public float nodeSpacing = 1.5f;
+    public float stuckCheckInterval = 0.45f;
+    public float minimumProgressDistance = 0.08f;
+
+    [Header("Debug")]
+    public bool showDebugLogs = false;
+    public bool drawNavigationGizmos = true;
+
+    private static readonly float[] SearchAngles =
     {
-        public Vector3 position;
-        public List<Vector3> triedDirections = new List<Vector3>();
-    }
+        0f, 30f, -30f, 45f, -45f, 60f, -60f,
+        90f, -90f, 120f, -120f, 150f, -150f, 180f
+    };
 
-    private Stack<PathNode> pathHistory = new Stack<PathNode>();
-    private Vector3 lastNodePos;
-    private bool backtracking = false;
-    private PathNode backtrackTargetNode;
+    private readonly float[] searchDistances = new float[3];
+    private readonly RaycastHit[] castBuffer = new RaycastHit[24];
+
+    private readonly Dictionary<Vector2Int, CellMemory> memory =
+        new Dictionary<Vector2Int, CellMemory>();
 
     private Rigidbody rb;
     private CapsuleCollider col;
 
-    private bool isGrounded = false;
-    private bool isJumping = false;
-    private bool blocked = false;
-    private bool aligning = false;
+    private NavigationState state = NavigationState.DirectMove;
 
-    private Vector3 currentCenter;
+    private Vector3 currentWaypoint;
+    private Vector3 movementDestination;
+    private Vector3 lastNodePosition;
+    private Vector3 lastProgressPosition;
+    private Vector3 jumpDirection;
 
+    private readonly Stack<Vector3> pathHistory = new Stack<Vector3>();
 
-    void Start()
+    private Vector2Int lastCell;
+
+    private bool hasWaypoint;
+    private bool hasMovementDestination;
+    private bool isGrounded;
+    private bool isJumping;
+    private bool arrivalRecorded;
+
+    private float nextJumpAllowedTime;
+    private float jumpStartedTime;
+    private float stuckTimer;
+    private float nextReplanTime;
+    private float nextWaypointCheckTime;
+    private float nextRecoveryTime;
+
+    private Collider currentJumpObstacle;
+
+    private void Start()
     {
         rb = GetComponent<Rigidbody>();
         col = GetComponent<CapsuleCollider>();
-        InitNavigation();
-    }
 
-    void Update()
-    {
+        if (target == null)
+        {
+            Log("Assign a target in the Inspector.");
+            enabled = false;
+            return;
+        }
+
+        rb.constraints |= RigidbodyConstraints.FreezeRotationX;
+        rb.constraints |= RigidbodyConstraints.FreezeRotationZ;
+
+        lastNodePosition = transform.position;
+        lastProgressPosition = transform.position;
+        pathHistory.Push(transform.position);
+
+        lastCell = new Vector2Int(int.MinValue, int.MinValue);
+
         isGrounded = CheckGrounded();
 
-        CheckCollision();
+        SetMovementDestination(target.position);
+    }
 
-        if (blocked) return;
+    private void Update()
+    {
+        if (target == null)
+            return;
+
+        isGrounded = CheckGrounded();
+
+        UpdateJumpState();
+        UpdateNavigation();
 
         if (!isJumping)
+            CheckForJumpableObstacle();
+
+        CheckForStuck();
+        RecordPathHistory();
+        TrackVisits();
+    }
+
+    // =========================================================
+    // SPATIAL MEMORY
+    // =========================================================
+
+    private Vector2Int ToCell(Vector3 position)
+    {
+        float size = Mathf.Max(0.1f, memoryCellSize);
+
+        return new Vector2Int(
+            Mathf.FloorToInt(position.x / size),
+            Mathf.FloorToInt(position.z / size)
+        );
+    }
+
+    private CellMemory GetCell(Vector2Int cell, float y)
+    {
+        if (!memory.TryGetValue(cell, out CellMemory data))
         {
-            // Debug.Log("Moving toward target.");
-            AnalyzeForwardObstacle();
-            HandleAlignment();
-            MoveToTarget();
+            data = new CellMemory { y = y };
+            memory[cell] = data;
         }
 
-        // Reset jump flag when landed
-        if (isGrounded && isJumping)
+        return data;
+    }
+
+    private void TrackVisits()
+    {
+        if (!isGrounded || isJumping)
+            return;
+
+        Vector2Int cell = ToCell(transform.position);
+
+        if (cell == lastCell)
+            return;
+
+        lastCell = cell;
+        GetCell(cell, transform.position.y).visits++;
+    }
+
+    private bool IsDeadEnd(Vector3 position)
+    {
+        return memory.TryGetValue(ToCell(position), out CellMemory data)
+               && data.deadEnd > 0;
+    }
+
+    // Marks the cell and its neighbours as a failed area.
+    private void MarkDeadEnd(Vector3 position)
+    {
+        Vector2Int center = ToCell(position);
+
+        for (int dx = -1; dx <= 1; dx++)
         {
-            isJumping = false;
-            Debug.Log("Landed.");
+            for (int dz = -1; dz <= 1; dz++)
+            {
+                CellMemory data = GetCell(
+                    new Vector2Int(center.x + dx, center.y + dz),
+                    position.y
+                );
+
+                data.deadEnd++;
+                data.proven = 0;
+            }
+        }
+
+        Log("Dead end remembered at " + position);
+    }
+
+    // Called once on arrival: the history stack is the working route.
+    private void CommitProvenPath()
+    {
+        Vector3 previous = transform.position;
+
+        foreach (Vector3 node in pathHistory)
+        {
+            MarkSegmentProven(previous, node);
+            previous = node;
+        }
+
+        MarkSegmentProven(previous, previous);
+
+        // New trip: forget how often cells were visited, keep the rest.
+        foreach (CellMemory data in memory.Values)
+            data.visits = 0;
+
+        Log("Route proven and stored.");
+    }
+
+    private void MarkSegmentProven(Vector3 from, Vector3 to)
+    {
+        float step = Mathf.Max(0.1f, memoryCellSize * 0.5f);
+        float length = HorizontalDistance(from, to);
+        int steps = Mathf.Max(1, Mathf.CeilToInt(length / step));
+
+        for (int i = 0; i <= steps; i++)
+        {
+            Vector3 point = Vector3.Lerp(from, to, i / (float)steps);
+            CellMemory data = GetCell(ToCell(point), point.y);
+
+            data.proven++;
+            data.deadEnd = 0;
         }
     }
 
-    // =====================================================
-    // GROUND CHECK
-    // =====================================================
+    // =========================================================
+    // JUMP STATE
+    // =========================================================
 
-    // bool CheckGrounded()
-    // {
-    //     Vector3 bottom = transform.position + Vector3.down * (col.height / 2f);
+    private void UpdateJumpState()
+    {
+        if (!isJumping)
+            return;
 
-    //     bool grounded = Physics.SphereCast(
-    //         bottom + Vector3.up * 0.1f,
-    //         col.radius * 0.9f,
-    //         Vector3.down,
-    //         out RaycastHit hit,
-    //         groundCheckDistance,
-    //         groundLayer
-    //     );
-    //     Debug.Log("Grounded: " + grounded);
+        bool minimumAirTimePassed = Time.time - jumpStartedTime > 0.2f;
 
-    //     Debug.DrawRay(bottom, Vector3.down * groundCheckDistance, grounded ? Color.green : Color.red);
-    //     return grounded;
-    // }
+        if (isGrounded && minimumAirTimePassed)
+        {
+            isJumping = false;
+            Log("Landed.");
+        }
+        else if (Time.time - jumpStartedTime > jumpLandingTimeout && isGrounded)
+        {
+            isJumping = false;
+            Log("Jump state recovered.");
+        }
+    }
 
-    bool CheckGrounded()
+    // =========================================================
+    // SMOOTH PHYSICS MOVEMENT
+    // =========================================================
+
+    private void FixedUpdate()
+    {
+        if (rb == null || target == null)
+            return;
+
+        if (!hasMovementDestination)
+        {
+            StopHorizontalMovement();
+            return;
+        }
+
+        Vector3 direction = movementDestination - transform.position;
+        direction.y = 0f;
+
+        float distance = direction.magnitude;
+
+        if (distance < 0.01f)
+        {
+            if (!hasWaypoint)
+                StopHorizontalMovement();
+            return;
+        }
+
+        // Only the final target stops the bot. Waypoints never do.
+        if (!hasWaypoint && distance <= stoppingDistance && !isJumping)
+        {
+            StopHorizontalMovement();
+            return;
+        }
+
+        direction /= distance;
+
+        Quaternion desiredRotation = Quaternion.LookRotation(direction);
+
+        float alignment = Mathf.Clamp01(
+            (Vector3.Dot(transform.forward, direction) + 1f) * 0.5f
+        );
+
+        float turnFactor = Mathf.Lerp(minimumTurnSpeed, 1f, alignment);
+
+        rb.MoveRotation(
+            Quaternion.Slerp(
+                rb.rotation,
+                desiredRotation,
+                rotateSpeed * turnFactor * Time.fixedDeltaTime
+            )
+        );
+
+        float angle = Vector3.Angle(transform.forward, direction);
+
+        float turnSpeedFactor = Mathf.Lerp(
+            0.4f,
+            1f,
+            1f - Mathf.Clamp01(angle / 120f)
+        );
+
+        Vector3 desiredVelocity;
+
+        if (isJumping)
+        {
+            desiredVelocity =
+                Time.time - jumpStartedTime < jumpForwardDuration
+                    ? jumpDirection * jumpForwardSpeed
+                    : direction * moveSpeed;
+        }
+        else
+        {
+            desiredVelocity = direction * moveSpeed * turnSpeedFactor;
+        }
+
+        Vector3 currentHorizontalVelocity = new Vector3(
+            rb.linearVelocity.x,
+            0f,
+            rb.linearVelocity.z
+        );
+
+        float rate =
+            desiredVelocity.sqrMagnitude > currentHorizontalVelocity.sqrMagnitude
+                ? acceleration
+                : deceleration;
+
+        float controlFactor = isGrounded ? 1f : airControl;
+
+        Vector3 newVelocity = Vector3.MoveTowards(
+            currentHorizontalVelocity,
+            desiredVelocity,
+            rate * controlFactor * Time.fixedDeltaTime
+        );
+
+        rb.linearVelocity = new Vector3(
+            newVelocity.x,
+            rb.linearVelocity.y,
+            newVelocity.z
+        );
+    }
+
+    // =========================================================
+    // NAVIGATION DECISIONS
+    // =========================================================
+
+    private void UpdateNavigation()
+    {
+        if (target == null)
+            return;
+
+        float targetDistance =
+            HorizontalDistance(transform.position, target.position);
+
+        if (targetDistance <= stoppingDistance)
+        {
+            if (!isJumping)
+            {
+                hasMovementDestination = false;
+                hasWaypoint = false;
+                state = NavigationState.DirectMove;
+
+                if (!arrivalRecorded)
+                {
+                    arrivalRecorded = true;
+                    CommitProvenPath();
+                }
+            }
+
+            return;
+        }
+
+        // Target moved away: allow a new arrival to be recorded.
+        if (targetDistance > stoppingDistance * 2f)
+            arrivalRecorded = false;
+
+        // Runs every frame so the bot never waits at a waypoint.
+        CheckWaypointArrival();
+
+        if (Time.time < nextReplanTime)
+            return;
+
+        nextReplanTime = Time.time + replanInterval;
+
+        switch (state)
+        {
+            case NavigationState.DirectMove:
+                HandleDirectMove();
+                break;
+
+            case NavigationState.MoveToWaypoint:
+                HandleWaypointMove();
+                break;
+
+            case NavigationState.Backtrack:
+                HandleBacktracking();
+                break;
+        }
+    }
+
+    private void CheckWaypointArrival()
+    {
+        if (!hasWaypoint)
+            return;
+
+        float speed = new Vector2(
+            rb.linearVelocity.x,
+            rb.linearVelocity.z
+        ).magnitude;
+
+        float reach = Mathf.Max(
+            waypointReachedDistance,
+            speed * lookAheadTime
+        );
+
+        if (HorizontalDistance(transform.position, currentWaypoint) > reach)
+            return;
+
+        // Arrived: pick the next goal immediately, in this same frame.
+        hasWaypoint = false;
+        state = NavigationState.DirectMove;
+        SetMovementDestination(target.position);
+
+        HandleDirectMove();
+        nextReplanTime = Time.time + replanInterval;
+    }
+
+    private void HandleDirectMove()
+    {
+        if (!HasObstacleOnPath(target.position))
+        {
+            hasWaypoint = false;
+            SetMovementDestination(target.position);
+            return;
+        }
+
+        if (TryFindWaypoint())
+            return;
+
+        if (StartBacktracking())
+            return;
+
+        Log("No available route yet.");
+    }
+
+    private void HandleWaypointMove()
+    {
+        if (!hasWaypoint)
+        {
+            state = NavigationState.DirectMove;
+            return;
+        }
+
+        if (Time.time < nextWaypointCheckTime)
+            return;
+
+        nextWaypointCheckTime = Time.time + waypointRecheckInterval;
+
+        if (!HasObstacleOnPath(target.position))
+        {
+            hasWaypoint = false;
+            state = NavigationState.DirectMove;
+            SetMovementDestination(target.position);
+            return;
+        }
+
+        if (!HasObstacleOnPath(currentWaypoint))
+            return;
+
+        MarkDeadEnd(currentWaypoint);
+        hasWaypoint = false;
+
+        if (TryFindWaypoint())
+            return;
+
+        StartBacktracking();
+    }
+
+    private void HandleBacktracking()
+    {
+        if (!hasWaypoint)
+        {
+            state = NavigationState.DirectMove;
+            return;
+        }
+
+        if (!HasObstacleOnPath(currentWaypoint))
+            return;
+
+        MarkDeadEnd(currentWaypoint);
+        hasWaypoint = false;
+
+        if (TryFindWaypoint())
+            return;
+
+        StartBacktracking();
+    }
+
+    // =========================================================
+    // WAYPOINT SEARCH (memory-aware)
+    // =========================================================
+
+    private bool TryFindWaypoint()
+    {
+        // First pass respects remembered dead ends. If everything is
+        // a dead end, retry them rather than freezing.
+        return TryFindWaypoint(false) || TryFindWaypoint(true);
+    }
+
+    private bool TryFindWaypoint(bool ignoreDeadEnds)
+    {
+        Vector3 toGoal = target.position - transform.position;
+        toGoal.y = 0f;
+
+        if (toGoal.sqrMagnitude < 0.001f)
+            return false;
+
+        Vector3 goalDirection = toGoal.normalized;
+
+        searchDistances[0] = waypointDistance;
+        searchDistances[1] = waypointDistance * 1.5f;
+        searchDistances[2] = waypointDistance * 0.7f;
+
+        bool found = false;
+        Vector3 bestWaypoint = Vector3.zero;
+        float bestScore = float.PositiveInfinity;
+
+        foreach (float distance in searchDistances)
+        {
+            foreach (float angle in SearchAngles)
+            {
+                Vector3 direction =
+                    Quaternion.Euler(0f, angle, 0f) * goalDirection;
+
+                Vector3 candidate =
+                    transform.position + direction * distance;
+
+                if (!TryGetGroundPosition(candidate, out Vector3 grounded))
+                    continue;
+
+                if (Mathf.Abs(grounded.y - transform.position.y)
+                    > waypointHeightTolerance)
+                    continue;
+
+                if (!ignoreDeadEnds && IsDeadEnd(grounded))
+                    continue;
+
+                if (HasObstacleOnPath(grounded))
+                    continue;
+
+                float remaining = HorizontalDistance(grounded, target.position);
+                float travel = HorizontalDistance(transform.position, grounded);
+
+                float headingPenalty =
+                    Vector3.Angle(transform.forward, direction) * 0.002f;
+
+                float score =
+                    remaining +
+                    travel * 0.15f +
+                    Mathf.Abs(angle) * 0.003f +
+                    headingPenalty;
+
+                // Memory: proven cells are preferred, revisits are penalized.
+                if (memory.TryGetValue(ToCell(grounded), out CellMemory data))
+                {
+                    if (data.proven > 0)
+                        score -= memoryStrength * 2f;
+                    else
+                        score += data.visits * memoryStrength;
+
+                    if (ignoreDeadEnds && data.deadEnd > 0)
+                        score += data.deadEnd * memoryStrength * 2f;
+                }
+
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    bestWaypoint = grounded;
+                    found = true;
+                }
+            }
+
+            if (found)
+                break;
+        }
+
+        if (!found)
+            return false;
+
+        currentWaypoint = bestWaypoint;
+        hasWaypoint = true;
+        state = NavigationState.MoveToWaypoint;
+
+        SetMovementDestination(currentWaypoint);
+        nextWaypointCheckTime = Time.time + waypointRecheckInterval;
+
+        Log("New waypoint: " + currentWaypoint);
+
+        return true;
+    }
+
+    private bool TryGetGroundPosition(
+        Vector3 candidate,
+        out Vector3 groundedPosition)
+    {
+        Vector3 origin = new Vector3(
+            candidate.x,
+            transform.position.y + groundProbeHeight,
+            candidate.z
+        );
+
+        if (!Physics.Raycast(
+            origin,
+            Vector3.down,
+            out RaycastHit hit,
+            maximumGroundProbeDistance,
+            groundLayer,
+            QueryTriggerInteraction.Ignore))
+        {
+            groundedPosition = Vector3.zero;
+            return false;
+        }
+
+        if (hit.normal.y < minimumGroundNormalY)
+        {
+            groundedPosition = Vector3.zero;
+            return false;
+        }
+
+        float verticalOffset = 0f;
+
+        if (Physics.Raycast(
+            transform.position + Vector3.up * 0.1f,
+            Vector3.down,
+            out RaycastHit currentGround,
+            groundCheckDistance + 0.2f,
+            groundLayer,
+            QueryTriggerInteraction.Ignore))
+        {
+            verticalOffset = transform.position.y - currentGround.point.y;
+        }
+
+        groundedPosition = new Vector3(
+            candidate.x,
+            hit.point.y + verticalOffset,
+            candidate.z
+        );
+
+        return true;
+    }
+
+    // =========================================================
+    // PATH BLOCKING
+    // =========================================================
+
+    private bool HasObstacleOnPath(Vector3 destination)
+    {
+        GetCapsulePoints(
+            out Vector3 point1,
+            out Vector3 point2,
+            out float radius
+        );
+
+        Vector3 direction = destination - transform.position;
+        direction.y = 0f;
+
+        float distance = direction.magnitude;
+
+        if (distance <= 0.1f)
+            return false;
+
+        direction /= distance;
+
+        float castDistance = Mathf.Max(0f, distance - stoppingDistance);
+
+        if (castDistance <= 0.05f)
+            return false;
+
+        int count = Physics.CapsuleCastNonAlloc(
+            point1,
+            point2,
+            radius,
+            direction,
+            castBuffer,
+            castDistance,
+            obstacleMask,
+            QueryTriggerInteraction.Ignore
+        );
+
+        for (int i = 0; i < count; i++)
+        {
+            Collider obstacle = castBuffer[i].collider;
+
+            if (obstacle == null)
+                continue;
+
+            if (IsOwnCollider(obstacle) || IsTargetCollider(obstacle))
+                continue;
+
+            if (IsGroundLayer(obstacle.gameObject.layer) ||
+                IsPassableLayer(obstacle.gameObject.layer))
+                continue;
+
+            return true;
+        }
+
+        return !HasGroundAlongPath(destination);
+    }
+
+    private bool HasGroundAlongPath(Vector3 destination)
+    {
+        Vector3 start = transform.position;
+
+        Vector3 flat = destination - start;
+        flat.y = 0f;
+
+        float dist = flat.magnitude;
+
+        if (dist < 0.1f)
+            return true;
+
+        Vector3 dir = flat / dist;
+
+        for (float d = groundSampleStep; d <= dist; d += groundSampleStep)
+        {
+            if (!TryGetGroundPosition(start + dir * d, out Vector3 g))
+                return false;
+
+            if (Mathf.Abs(g.y - start.y) > waypointHeightTolerance)
+                return false;
+        }
+
+        return true;
+    }
+
+    private void GetCapsulePoints(
+        out Vector3 point1,
+        out Vector3 point2,
+        out float radius)
     {
         Vector3 center = transform.TransformPoint(col.center);
-        Vector3 bottom = center - transform.up * (col.height / 2f);
+        Vector3 scale = transform.lossyScale;
+
+        radius = col.radius * Mathf.Max(
+            Mathf.Abs(scale.x),
+            Mathf.Abs(scale.z)
+        );
+
+        float height = Mathf.Max(
+            col.height * Mathf.Abs(scale.y),
+            radius * 2f
+        );
+
+        radius = Mathf.Max(radius - capsuleCastPadding, 0.01f);
+
+        float halfSegment = Mathf.Max(height * 0.5f - radius, 0f);
+
+        point1 = center + transform.up * halfSegment;
+        point2 = center - transform.up * halfSegment;
+    }
+
+    private bool IsOwnCollider(Collider other)
+    {
+        return other.transform == transform ||
+               other.transform.IsChildOf(transform);
+    }
+
+    private bool IsTargetCollider(Collider other)
+    {
+        return other.transform == target ||
+               other.transform.IsChildOf(target);
+    }
+
+    private bool IsGroundLayer(int layer)
+    {
+        return (groundLayer.value & (1 << layer)) != 0;
+    }
+
+    private bool IsPassableLayer(int layer)
+    {
+        int passableLayer = LayerMask.NameToLayer("passable");
+
+        return passableLayer >= 0 && layer == passableLayer;
+    }
+
+    // =========================================================
+    // JUMP DETECTION AND EXECUTION
+    // =========================================================
+
+    private void CheckForJumpableObstacle()
+    {
+        if (!isGrounded || isJumping || Time.time < nextJumpAllowedTime)
+            return;
+
+        Vector3 direction = GetDesiredDirection();
+
+        if (direction.sqrMagnitude < 0.001f)
+            return;
+
+        GetCapsulePoints(
+            out Vector3 point1,
+            out Vector3 point2,
+            out float radius
+        );
+
+        int count = Physics.CapsuleCastNonAlloc(
+            point1,
+            point2,
+            radius,
+            direction,
+            castBuffer,
+            obstacleCheckDistance,
+            obstacleMask,
+            QueryTriggerInteraction.Ignore
+        );
+
+        bool previousObstacleStillAhead = false;
+
+        for (int i = 0; i < count; i++)
+        {
+            Collider obstacle = castBuffer[i].collider;
+
+            if (obstacle == null ||
+                IsOwnCollider(obstacle) ||
+                IsTargetCollider(obstacle) ||
+                IsGroundLayer(obstacle.gameObject.layer) ||
+                IsPassableLayer(obstacle.gameObject.layer))
+            {
+                continue;
+            }
+
+            if (obstacle == currentJumpObstacle)
+            {
+                previousObstacleStillAhead = true;
+                continue;
+            }
+
+            float groundY = transform.position.y;
+
+            if (Physics.Raycast(
+                transform.position + Vector3.up * 0.1f,
+                Vector3.down,
+                out RaycastHit groundHit,
+                groundCheckDistance + 0.2f,
+                groundLayer,
+                QueryTriggerInteraction.Ignore))
+            {
+                groundY = groundHit.point.y;
+            }
+
+            float obstacleHeight = obstacle.bounds.max.y - groundY;
+
+            if (obstacleHeight > 0f && obstacleHeight <= maxJumpableHeight)
+            {
+                currentJumpObstacle = obstacle;
+                Jump();
+                return;
+            }
+        }
+
+        if (!previousObstacleStillAhead)
+            currentJumpObstacle = null;
+    }
+
+    private void Jump()
+    {
+        if (!isGrounded || isJumping)
+            return;
+
+        jumpDirection = GetDesiredDirection();
+
+        if (jumpDirection.sqrMagnitude < 0.001f)
+            jumpDirection = transform.forward;
+
+        jumpDirection.y = 0f;
+        jumpDirection.Normalize();
+
+        isJumping = true;
+        jumpStartedTime = Time.time;
+        nextJumpAllowedTime = Time.time + jumpCooldown;
+
+        Vector3 velocity = rb.linearVelocity;
+        velocity.y = 0f;
+        rb.linearVelocity = velocity;
+
+        rb.AddForce(Vector3.up * jumpForce, ForceMode.Impulse);
+
+        Log("Jumping forward.");
+    }
+
+    // =========================================================
+    // GROUND DETECTION
+    // =========================================================
+
+    private bool CheckGrounded()
+    {
+        Vector3 center = transform.TransformPoint(col.center);
+
+        float bottomOffset =
+            col.height * Mathf.Abs(transform.lossyScale.y) * 0.5f;
+
+        Vector3 bottom = center - transform.up * bottomOffset;
         Vector3 origin = bottom + Vector3.up * 0.1f;
 
-        bool grounded = Physics.Raycast(origin, Vector3.down, out RaycastHit hit, groundCheckDistance + 0.1f, groundLayer);
+        bool grounded = Physics.Raycast(
+            origin,
+            Vector3.down,
+            out RaycastHit hit,
+            groundCheckDistance + 0.1f,
+            groundLayer,
+            QueryTriggerInteraction.Ignore
+        );
 
-        // if (grounded)
-        //     Debug.Log("Hit: " + hit.collider.gameObject.name + " | Layer: " + LayerMask.LayerToName(hit.collider.gameObject.layer));
-        // else
-        //     Debug.Log("Hit nothing");
+        if (grounded && hit.normal.y < minimumGroundNormalY)
+            grounded = false;
 
-        Debug.DrawRay(origin, Vector3.down * (groundCheckDistance + 0.1f), grounded ? Color.green : Color.red);
+        Debug.DrawRay(
+            origin,
+            Vector3.down * (groundCheckDistance + 0.1f),
+            grounded ? Color.green : Color.red
+        );
+
         return grounded;
     }
 
-    // =====================================================
-    // CORE MOVEMENT
-    // =====================================================
-
-    void InitNavigation()
+    private Vector3 GetDesiredDirection()
     {
-        lastNodePos = transform.position;
-        pathHistory.Push(new PathNode { position = transform.position });
-    }
+        Vector3 destination = target.position;
 
-void MoveToTarget()
-{
-    if (target == null || aligning) return;
-
-    if (backtracking)
-    {
-        HandleBacktrack();
-        return;
-    }
-
-    if (searchingAlternate)
-    {
-        HandleAlternateSearch();
-        return;
-    }
-
-    Vector3 desiredDir;
-
-    if (useAlternateDir)
-    {
-        desiredDir = activeAlternateDir;
-
-        // Once mostly facing/following this direction, hand control back to normal seeking
-        if (Vector3.Angle(transform.forward, activeAlternateDir) < 5f)
+        if ((state == NavigationState.MoveToWaypoint ||
+             state == NavigationState.Backtrack) && hasWaypoint)
         {
-            useAlternateDir = false;
-        }
-    }
-    else
-    {
-        Vector3 dir = (target.position - transform.position);
-        dir.y = 0f;
-
-        if (dir.magnitude < 0.2f) return;
-
-        desiredDir = dir.normalized;
-    }
-
-    if (Vector3.Distance(transform.position, lastNodePos) >= nodeSpacing)
-    {
-        lastNodePos = transform.position;
-        pathHistory.Push(new PathNode { position = transform.position });
-    }
-
-    if (isGrounded && !IsWalkable(transform.position + desiredDir * stepDistance))
-    {
-        Debug.Log("Path blocked — beginning angle search.");
-        StartAlternateSearch(desiredDir);
-        rb.linearVelocity = new Vector3(0f, rb.linearVelocity.y, 0f);
-        return;
-    }
-
-    Quaternion lookRot = Quaternion.LookRotation(desiredDir);
-    transform.rotation = Quaternion.Slerp(transform.rotation, lookRot, rotateSpeed * Time.deltaTime);
-
-    float angleToTarget = Vector3.Angle(transform.forward, desiredDir);
-
-    if (angleToTarget < 15f)
-    {
-        Vector3 velocity = transform.forward * moveSpeed;
-        velocity.y = rb.linearVelocity.y;
-        rb.linearVelocity = velocity;
-    }
-    else
-    {
-        rb.linearVelocity = new Vector3(0f, rb.linearVelocity.y, 0f);
-    }
-}
-
-// =====================================================
-// ALTERNATE DIRECTION SEARCH (stateful, spans frames)
-// =====================================================
-
-void StartAlternateSearch(Vector3 blockedDir)
-    {
-        searchBlockedDir = blockedDir;
-        pendingAngles.Clear();
-
-        // Build ordered list of angles to try: +45, -45, +90, -90, +135, -135
-        for (float angle = alternateAngle; angle <= 135f; angle += alternateAngle)
-        {
-            pendingAngles.Add(angle);
-            pendingAngles.Add(-angle);
+            destination = currentWaypoint;
         }
 
-        searchingAlternate = true;
-        PickNextTestAngle();
+        Vector3 direction = destination - transform.position;
+        direction.y = 0f;
+
+        return direction.normalized;
     }
 
-void PickNextTestAngle()
+    // =========================================================
+    // STUCK RECOVERY
+    // =========================================================
+
+    private void CheckForStuck()
     {
-        if (pendingAngles.Count == 0)
+        if (!hasMovementDestination || isJumping)
         {
-            Debug.Log("No alternate direction found — dead end.");
-            searchingAlternate = false;
-            StartBacktrack();
+            stuckTimer = 0f;
+            lastProgressPosition = transform.position;
             return;
         }
 
-        currentTestAngle = pendingAngles[0];
-        pendingAngles.RemoveAt(0);
-        currentTestDir = Quaternion.Euler(0, currentTestAngle, 0) * searchBlockedDir;
+        stuckTimer += Time.deltaTime;
 
-        Debug.Log("Testing angle: " + currentTestAngle);
-    }
-
-void HandleAlternateSearch()
-    {
-        Quaternion lookRot = Quaternion.LookRotation(currentTestDir);
-        transform.rotation = Quaternion.Slerp(transform.rotation, lookRot, angleTestRotateSpeed * Time.deltaTime);
-
-        rb.linearVelocity = new Vector3(0f, rb.linearVelocity.y, 0f);
-
-        float angleRemaining = Vector3.Angle(transform.forward, currentTestDir);
-
-        if (angleRemaining < angleFacingTolerance)
-        {
-            PathNode current = pathHistory.Peek();
-
-            if (IsDirectionUsable(currentTestDir, current))
-            {
-                Debug.Log("Found walkable path at angle: " + currentTestAngle);
-                current.triedDirections.Add(currentTestDir);
-
-                activeAlternateDir = currentTestDir;
-                useAlternateDir = true;
-                searchingAlternate = false;
-            }
-            else
-            {
-                Debug.Log("Angle " + currentTestAngle + " not walkable, trying next.");
-                PickNextTestAngle();
-            }
-        }
-    }
-bool IsDirectionUsable(Vector3 dir, PathNode node)
-    {
-        // Skip directions already tried and failed from this node
-        foreach (Vector3 tried in node.triedDirections)
-        {
-            if (Vector3.Angle(tried, dir) < 10f) return false;
-        }
-
-        return IsWalkable(transform.position + dir * alternateCheckDistance);
-    }
-
-void StartBacktrack()
-    {
-        if (pathHistory.Count <= 1)
-        {
-            Debug.Log("No path left to backtrack to.");
+        if (stuckTimer < stuckCheckInterval)
             return;
-        }
 
-        pathHistory.Pop(); // discard current dead-end node
-        backtrackTargetNode = pathHistory.Peek();
-        backtracking = true;
-    }
+        float progress = HorizontalDistance(
+            transform.position,
+            lastProgressPosition
+        );
 
-void HandleBacktrack()
-    {
-        Vector3 dir = backtrackTargetNode.position - transform.position;
-        dir.y = 0f;
+        lastProgressPosition = transform.position;
+        stuckTimer = 0f;
 
-        if (dir.magnitude < 0.2f)
-        {
-            backtracking = false;
-            Debug.Log("Reached backtrack node — resuming search.");
+        if (progress >= minimumProgressDistance)
             return;
-        }
 
-        Vector3 moveDir = dir.normalized;
-        Quaternion lookRot = Quaternion.LookRotation(moveDir);
-        transform.rotation = Quaternion.Slerp(transform.rotation, lookRot, rotateSpeed * Time.deltaTime);
+        if (Time.time < nextRecoveryTime)
+            return;
 
-        Vector3 velocity = moveDir * moveSpeed;
-        velocity.y = rb.linearVelocity.y;
-        rb.linearVelocity = velocity;
+        nextRecoveryTime = Time.time + stuckRecoveryCooldown;
+
+        Log("Stuck detected; recovering.");
+
+        if (hasWaypoint)
+            MarkDeadEnd(currentWaypoint);
+
+        hasWaypoint = false;
+
+        if (TryFindWaypoint())
+            return;
+
+        if (StartBacktracking())
+            return;
+
+        state = NavigationState.DirectMove;
+        nextReplanTime = 0f;
     }
-    // =====================================================
-    // WALKABLE CHECKER
-    // =====================================================
 
-    bool IsWalkable(Vector3 checkPos)
+    private bool StartBacktracking()
     {
-        Vector3 origin = new Vector3(checkPos.x, transform.position.y + 1f, checkPos.z);
+        // The area we are retreating from did not work: remember it.
+        MarkDeadEnd(transform.position);
 
-        if (Physics.Raycast(origin, Vector3.down, out RaycastHit hit, 5f, groundLayer))
+        while (pathHistory.Count > 1)
         {
-            if (hit.normal.y > 0.7f)
+            if (HorizontalDistance(
+                pathHistory.Peek(),
+                transform.position
+            ) < waypointReachedDistance)
             {
-                Debug.DrawRay(origin, Vector3.down * 5f, Color.green);
-                return true;
+                pathHistory.Pop();
+                continue;
             }
+
+            Vector3 previousNode = pathHistory.Pop();
+
+            if (HorizontalDistance(
+                previousNode,
+                transform.position
+            ) < waypointReachedDistance)
+            {
+                continue;
+            }
+
+            if (HasObstacleOnPath(previousNode))
+            {
+                // Unreachable node from here: part of the failed branch.
+                MarkDeadEnd(previousNode);
+                continue;
+            }
+
+            currentWaypoint = previousNode;
+            hasWaypoint = true;
+            state = NavigationState.Backtrack;
+
+            SetMovementDestination(currentWaypoint);
+
+            Log("Backtracking.");
+
+            return true;
         }
 
-        Debug.DrawRay(origin, Vector3.down * 5f, Color.red);
         return false;
     }
 
-    // =====================================================
-    // SIMULATED COLLISION
-    // =====================================================
-
-    void CheckCollision()
+    private void RecordPathHistory()
     {
-        Vector3 center = transform.TransformPoint(col.center);
-        float radius = col.radius * transform.localScale.x;
-        float halfHeight = Mathf.Max(col.height * 0.5f - col.radius, 0f);
-
-        Vector3 point1 = center + transform.up * halfHeight;
-        Vector3 point2 = center - transform.up * halfHeight;
-
-        Vector3 moveDir = target != null
-            ? (target.position - transform.position).normalized
-            : transform.forward;
-
-        moveDir.y = 0f;
-
-        if (Physics.CapsuleCast(point1, point2, radius, moveDir, out RaycastHit hit, 0.15f))
-        {
-            if (hit.collider.gameObject != gameObject &&
-                hit.collider.gameObject.layer != LayerMask.NameToLayer("passable"))
-            {
-                if (!blocked)
-                {
-                    blocked = true;
-                    rb.linearVelocity = new Vector3(0, rb.linearVelocity.y, 0); // stop horizontal, keep gravity
-                    Debug.Log("Blocked by: " + hit.collider.name);
-                }
-            }
-        }
-        else
-        {
-            if (blocked)
-            {
-                blocked = false;
-                Debug.Log("Unblocked.");
-            }
-        }
-    }
-
-    // =====================================================
-    // FORWARD SENSOR
-    // =====================================================
-
-    void AnalyzeForwardObstacle()
-    {
-        Vector3 center = transform.TransformPoint(col.center);
-        float radius = col.radius * transform.localScale.x;
-        float halfHeight = Mathf.Max(col.height * 0.5f - col.radius, 0f);
-
-        Vector3 point1 = center + transform.up * halfHeight;
-        Vector3 point2 = center - transform.up * halfHeight;
-
-        Debug.DrawRay(center, transform.forward * obstacleCheckDistance, Color.cyan);
-
-        if (Physics.CapsuleCast(point1, point2, radius, transform.forward,
-            out RaycastHit hit, obstacleCheckDistance))
-        {
-            if (hit.collider.gameObject != gameObject) 
-            {
-                // Debug.Log("Obstacle detected: " + hit.collider.name);
-                AnalyzeObstacle(hit);
-            }
-        }
-    }
-
-    // =====================================================
-    // DECISION MAKING
-    // =====================================================
-
-    void AnalyzeObstacle(RaycastHit hit)
-    {
-        Debug.Log("Analyzing obstacle: " + hit.collider.name);
-        Collider obstacle = hit.collider;
-        float height = obstacle.bounds.size.y;
-
-        Transform center = obstacle.transform.Find("Center");
-        if (center != null && !aligning)
-        {
-            currentCenter = center.position;
-            aligning = true;
-        }
-
-        // if (obstacle.CompareTag("Jump_type"))
-        // {
-        //     Jump();
-        //     return;
-        // }
-
-        // if (obstacle.CompareTag("Slide_type"))
-        // {
-        //     // Slide logic here
-        //     return;
-        // }
-
-        if (height <= maxJumpableHeight)
-        {
-            Debug.Log("Jumpable obstacle detected: " + obstacle.name);
-            Jump();
-        }
-        else
-        {
-            Debug.Log("Obstacle too large: " + obstacle.name);
-        }
-    }
-
-    // =====================================================
-    // ALIGNMENT
-    // =====================================================
-
-    void HandleAlignment()
-    {
-        if (!aligning) return;
-
-        Vector3 targetPos = new Vector3(currentCenter.x, transform.position.y, currentCenter.z);
-
-        transform.position = Vector3.MoveTowards(
+        if (HorizontalDistance(
             transform.position,
-            targetPos,
-            moveSpeed * Time.deltaTime
-        );
-
-        float dist = Vector2.Distance(
-            new Vector2(transform.position.x, transform.position.z),
-            new Vector2(currentCenter.x, currentCenter.z)
-        );
-
-        if (dist < 0.05f)
+            lastNodePosition
+        ) < nodeSpacing)
         {
-            aligning = false;
-            Debug.Log("Aligned.");
+            return;
+        }
+
+        lastNodePosition = transform.position;
+
+        if (pathHistory.Count == 0 ||
+            HorizontalDistance(
+                pathHistory.Peek(),
+                transform.position
+            ) > waypointReachedDistance)
+        {
+            pathHistory.Push(transform.position);
+        }
+
+        if (pathHistory.Count > 100)
+        {
+            Vector3[] recent = pathHistory.ToArray();
+            pathHistory.Clear();
+
+            for (int i = recent.Length - 1; i >= 1; i--)
+                pathHistory.Push(recent[i]);
         }
     }
 
-    // =====================================================
-    // JUMP
-    // =====================================================
+    // =========================================================
+    // HELPERS
+    // =========================================================
 
-    void Jump()
+    private void SetMovementDestination(Vector3 destination)
     {
-        if (isJumping || !isGrounded) return;
-
-        Debug.Log("Preparing to jump.");
-        Debug.Log("Preparing to jump.");
-        isJumping = true;
-        rb.linearVelocity = new Vector3(rb.linearVelocity.x, 0f, rb.linearVelocity.z); // reset Y first
-        rb.AddForce(Vector3.up * jumpForce, ForceMode.Impulse);
-        Debug.Log("Jump!");
+        movementDestination = destination;
+        hasMovementDestination = true;
     }
 
-    // =====================================================
-    // DEBUG
-    // =====================================================
-
-    void OnDrawGizmosSelected()
+    private void StopHorizontalMovement()
     {
-        if (target == null) return;
-        Gizmos.color = Color.yellow;
-        Gizmos.DrawLine(transform.position, target.position);
+        if (rb == null)
+            return;
 
-        if (searchingAlternate)
+        Vector3 velocity = rb.linearVelocity;
+        velocity.x = 0f;
+        velocity.z = 0f;
+        rb.linearVelocity = velocity;
+    }
+
+    private float HorizontalDistance(Vector3 a, Vector3 b)
+    {
+        a.y = 0f;
+        b.y = 0f;
+
+        return Vector3.Distance(a, b);
+    }
+
+    private void Log(string message)
+    {
+        if (showDebugLogs)
+            Debug.Log("[Auto_movement] " + message, this);
+    }
+
+    // =========================================================
+    // GIZMOS
+    // =========================================================
+
+    private void OnDrawGizmosSelected()
+    {
+        if (!drawNavigationGizmos)
+            return;
+
+        if (target != null)
         {
-            Gizmos.color = Color.magenta;
-            Gizmos.DrawSphere(transform.position + currentTestDir * alternateCheckDistance, 0.15f);
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawLine(transform.position, target.position);
+            Gizmos.DrawSphere(target.position, 0.2f);
+        }
+
+        if (Application.isPlaying && hasWaypoint)
+        {
+            Gizmos.color =
+                state == NavigationState.Backtrack ? Color.red : Color.magenta;
+
+            Gizmos.DrawSphere(currentWaypoint, 0.2f);
+            Gizmos.DrawLine(transform.position, currentWaypoint);
+        }
+
+        if (!Application.isPlaying)
+            return;
+
+        float size = Mathf.Max(0.1f, memoryCellSize);
+        Vector3 cube = new Vector3(size * 0.9f, 0.05f, size * 0.9f);
+
+        foreach (KeyValuePair<Vector2Int, CellMemory> pair in memory)
+        {
+            CellMemory data = pair.Value;
+
+            Vector3 center = new Vector3(
+                (pair.Key.x + 0.5f) * size,
+                data.y + 0.05f,
+                (pair.Key.y + 0.5f) * size
+            );
+
+            if (data.deadEnd > 0)
+                Gizmos.color = Color.red;
+            else if (data.proven > 0)
+                Gizmos.color = Color.green;
+            else if (data.visits > 0)
+                Gizmos.color = new Color(1f, 0.9f, 0.2f, 0.6f);
+            else
+                continue;
+
+            Gizmos.DrawWireCube(center, cube);
         }
     }
 }
