@@ -8,7 +8,8 @@ public class Auto_movement : MonoBehaviour
     {
         DirectMove,
         MoveToWaypoint,
-        Backtrack
+        Backtrack,
+        KnownRoute
     }
 
     private class CellMemory
@@ -17,6 +18,13 @@ public class Auto_movement : MonoBehaviour
         public int deadEnd;
         public int proven;
         public float y;
+    }
+
+    private class RouteNode
+    {
+        public Vector3 pos;
+        public bool alive = true;
+        public List<int> links = new List<int>();
     }
 
     [Header("Target")]
@@ -40,6 +48,9 @@ public class Auto_movement : MonoBehaviour
     [Tooltip("How strongly the bot avoids revisited cells and prefers proven ones. 0 = no memory influence.")]
     public float memoryStrength = 1.5f;
     public float memoryCellSize = 1f;
+
+    [Tooltip("How close the target (and the bot) must be to a remembered spot to reuse the known route. Higher = reuses routes more often.")]
+    public float routeMatchRadius = 2f;
 
     [Header("Obstacle Detection")]
     public float obstacleCheckDistance = 2.5f;
@@ -81,6 +92,9 @@ public class Auto_movement : MonoBehaviour
     public bool showDebugLogs = false;
     public bool drawNavigationGizmos = true;
 
+    private const float RoutePlanCooldown = 0.5f;
+    private const int MaxRouteNodes = 1500;
+
     private static readonly float[] SearchAngles =
     {
         0f, 30f, -30f, 45f, -45f, 60f, -60f,
@@ -92,6 +106,17 @@ public class Auto_movement : MonoBehaviour
 
     private readonly Dictionary<Vector2Int, CellMemory> memory =
         new Dictionary<Vector2Int, CellMemory>();
+
+    // Route map: every place the bot has walked, linked in walking order.
+    private readonly List<RouteNode> routeNodes = new List<RouteNode>();
+    private readonly List<int> knownRouteIds = new List<int>();
+    private float[] planDist = new float[0];
+    private int[] planPrev = new int[0];
+    private bool[] planDone = new bool[0];
+    private int lastRouteNode = -1;
+    private int knownRouteIndex;
+    private Vector3 routeGoalPosition;
+    private float nextRoutePlanTime;
 
     private Rigidbody rb;
     private CapsuleCollider col;
@@ -164,7 +189,263 @@ public class Auto_movement : MonoBehaviour
 
         CheckForStuck();
         RecordPathHistory();
+        RecordRouteNode();
         TrackVisits();
+    }
+
+    // =========================================================
+    // ROUTE MAP (remembered walked paths)
+    // =========================================================
+
+    private void RecordRouteNode()
+    {
+        if (!isGrounded || isJumping)
+            return;
+
+        Vector3 pos = transform.position;
+
+        if (IsDeadEnd(pos))
+            return;
+
+        if (lastRouteNode >= 0 &&
+            routeNodes[lastRouteNode].alive &&
+            HorizontalDistance(pos, routeNodes[lastRouteNode].pos) < nodeSpacing)
+        {
+            return;
+        }
+
+        // Reuse an existing node if we are standing on known ground.
+        int id = NearestRouteNode(pos, nodeSpacing * 0.6f);
+
+        if (id < 0)
+        {
+            if (routeNodes.Count >= MaxRouteNodes)
+                return;
+
+            routeNodes.Add(new RouteNode { pos = pos });
+            id = routeNodes.Count - 1;
+        }
+
+        if (lastRouteNode >= 0 &&
+            lastRouteNode != id &&
+            routeNodes[lastRouteNode].alive)
+        {
+            LinkNodes(lastRouteNode, id);
+        }
+
+        lastRouteNode = id;
+    }
+
+    private void LinkNodes(int a, int b)
+    {
+        if (!routeNodes[a].links.Contains(b))
+            routeNodes[a].links.Add(b);
+
+        if (!routeNodes[b].links.Contains(a))
+            routeNodes[b].links.Add(a);
+    }
+
+    private int NearestRouteNode(Vector3 position, float radius)
+    {
+        int best = -1;
+        float bestDistance = radius;
+
+        for (int i = 0; i < routeNodes.Count; i++)
+        {
+            RouteNode node = routeNodes[i];
+
+            if (!node.alive)
+                continue;
+
+            if (Mathf.Abs(node.pos.y - position.y) > waypointHeightTolerance)
+                continue;
+
+            float d = HorizontalDistance(node.pos, position);
+
+            if (d < bestDistance)
+            {
+                bestDistance = d;
+                best = i;
+            }
+        }
+
+        return best;
+    }
+
+    // Nearest remembered node the bot can actually walk to from here.
+    private int FindVisibleStartNode()
+    {
+        int best = -1;
+        float bestDistance = routeMatchRadius;
+
+        for (int i = 0; i < routeNodes.Count; i++)
+        {
+            RouteNode node = routeNodes[i];
+
+            if (!node.alive)
+                continue;
+
+            if (Mathf.Abs(node.pos.y - transform.position.y) > waypointHeightTolerance)
+                continue;
+
+            float d = HorizontalDistance(node.pos, transform.position);
+
+            if (d >= bestDistance)
+                continue;
+
+            if (d > 0.3f && HasObstacleOnPath(node.pos))
+                continue;
+
+            bestDistance = d;
+            best = i;
+        }
+
+        return best;
+    }
+
+    // A failed spot is removed from the route map.
+    private void RemoveRouteNodesNear(Vector3 position, float radius)
+    {
+        for (int i = 0; i < routeNodes.Count; i++)
+        {
+            RouteNode node = routeNodes[i];
+
+            if (!node.alive)
+                continue;
+
+            if (HorizontalDistance(node.pos, position) > radius)
+                continue;
+
+            node.alive = false;
+
+            foreach (int other in node.links)
+                routeNodes[other].links.Remove(i);
+
+            node.links.Clear();
+
+            if (lastRouteNode == i)
+                lastRouteNode = -1;
+        }
+    }
+
+    private bool TryFollowKnownRoute()
+    {
+        if (Time.time < nextRoutePlanTime)
+            return false;
+
+        if (!PlanKnownRoute())
+        {
+            nextRoutePlanTime = Time.time + RoutePlanCooldown;
+            return false;
+        }
+
+        knownRouteIndex = 0;
+        routeGoalPosition = target.position;
+
+        currentWaypoint = routeNodes[knownRouteIds[0]].pos;
+        hasWaypoint = true;
+        state = NavigationState.KnownRoute;
+
+        SetMovementDestination(currentWaypoint);
+        nextWaypointCheckTime = Time.time + waypointRecheckInterval;
+
+        Log("Following known route (" + knownRouteIds.Count + " nodes).");
+
+        return true;
+    }
+
+    // Shortest path over the walked-route graph.
+    private bool PlanKnownRoute()
+    {
+        int goal = NearestRouteNode(target.position, routeMatchRadius);
+
+        if (goal < 0)
+            return false;
+
+        int start = FindVisibleStartNode();
+
+        if (start < 0)
+            return false;
+
+        int n = routeNodes.Count;
+
+        if (planDist.Length < n)
+        {
+            planDist = new float[n];
+            planPrev = new int[n];
+            planDone = new bool[n];
+        }
+
+        for (int i = 0; i < n; i++)
+        {
+            planDist[i] = float.PositiveInfinity;
+            planPrev[i] = -1;
+            planDone[i] = false;
+        }
+
+        planDist[start] = 0f;
+
+        while (true)
+        {
+            int u = -1;
+            float best = float.PositiveInfinity;
+
+            for (int i = 0; i < n; i++)
+            {
+                if (!planDone[i] && routeNodes[i].alive && planDist[i] < best)
+                {
+                    best = planDist[i];
+                    u = i;
+                }
+            }
+
+            if (u < 0 || u == goal)
+                break;
+
+            planDone[u] = true;
+
+            foreach (int v in routeNodes[u].links)
+            {
+                if (!routeNodes[v].alive || planDone[v])
+                    continue;
+
+                float nd = planDist[u] +
+                           Vector3.Distance(routeNodes[u].pos, routeNodes[v].pos);
+
+                if (nd < planDist[v])
+                {
+                    planDist[v] = nd;
+                    planPrev[v] = u;
+                }
+            }
+        }
+
+        if (float.IsPositiveInfinity(planDist[goal]))
+            return false;
+
+        knownRouteIds.Clear();
+
+        for (int c = goal; c != -1; c = planPrev[c])
+            knownRouteIds.Add(c);
+
+        knownRouteIds.Reverse();
+
+        return true;
+    }
+
+    private bool AdvanceKnownRoute()
+    {
+        knownRouteIndex++;
+
+        if (knownRouteIndex >= knownRouteIds.Count)
+            return false;
+
+        currentWaypoint = routeNodes[knownRouteIds[knownRouteIndex]].pos;
+        hasWaypoint = true;
+
+        SetMovementDestination(currentWaypoint);
+
+        return true;
     }
 
     // =========================================================
@@ -230,6 +511,9 @@ public class Auto_movement : MonoBehaviour
                 data.proven = 0;
             }
         }
+
+        // The failed area is also removed from the route map.
+        RemoveRouteNodesNear(position, memoryCellSize * 1.5f);
 
         Log("Dead end remembered at " + position);
     }
@@ -448,6 +732,10 @@ public class Auto_movement : MonoBehaviour
             case NavigationState.Backtrack:
                 HandleBacktracking();
                 break;
+
+            case NavigationState.KnownRoute:
+                HandleKnownRoute();
+                break;
         }
     }
 
@@ -469,8 +757,13 @@ public class Auto_movement : MonoBehaviour
         if (HorizontalDistance(transform.position, currentWaypoint) > reach)
             return;
 
-        // Arrived: pick the next goal immediately, in this same frame.
         hasWaypoint = false;
+
+        // On a known route, move straight on to the next remembered node.
+        if (state == NavigationState.KnownRoute && AdvanceKnownRoute())
+            return;
+
+        // Arrived: pick the next goal immediately, in this same frame.
         state = NavigationState.DirectMove;
         SetMovementDestination(target.position);
 
@@ -487,6 +780,10 @@ public class Auto_movement : MonoBehaviour
             return;
         }
 
+        // Known ground first: reuse a remembered route if one exists.
+        if (TryFollowKnownRoute())
+            return;
+
         if (TryFindWaypoint())
             return;
 
@@ -494,6 +791,39 @@ public class Auto_movement : MonoBehaviour
             return;
 
         Log("No available route yet.");
+    }
+
+    private void HandleKnownRoute()
+    {
+        if (!hasWaypoint)
+        {
+            state = NavigationState.DirectMove;
+            return;
+        }
+
+        if (Time.time < nextWaypointCheckTime)
+            return;
+
+        nextWaypointCheckTime = Time.time + waypointRecheckInterval;
+
+        // Target was moved: this route no longer leads to it.
+        if (HorizontalDistance(target.position, routeGoalPosition)
+            > routeMatchRadius)
+        {
+            hasWaypoint = false;
+            state = NavigationState.DirectMove;
+            nextRoutePlanTime = 0f;
+            HandleDirectMove();
+            return;
+        }
+
+        // Shortcut: the target became directly reachable.
+        if (!HasObstacleOnPath(target.position))
+        {
+            hasWaypoint = false;
+            state = NavigationState.DirectMove;
+            SetMovementDestination(target.position);
+        }
     }
 
     private void HandleWaypointMove()
@@ -516,6 +846,10 @@ public class Auto_movement : MonoBehaviour
             SetMovementDestination(target.position);
             return;
         }
+
+        // The target may have been moved onto known ground.
+        if (TryFollowKnownRoute())
+            return;
 
         if (!HasObstacleOnPath(currentWaypoint))
             return;
@@ -980,11 +1314,8 @@ public class Auto_movement : MonoBehaviour
     {
         Vector3 destination = target.position;
 
-        if ((state == NavigationState.MoveToWaypoint ||
-             state == NavigationState.Backtrack) && hasWaypoint)
-        {
+        if (state != NavigationState.DirectMove && hasWaypoint)
             destination = currentWaypoint;
-        }
 
         Vector3 direction = destination - transform.position;
         direction.y = 0f;
@@ -1028,10 +1359,21 @@ public class Auto_movement : MonoBehaviour
 
         Log("Stuck detected; recovering.");
 
+        bool wasKnownRoute = state == NavigationState.KnownRoute;
+
         if (hasWaypoint)
             MarkDeadEnd(currentWaypoint);
 
         hasWaypoint = false;
+
+        // A remembered route failed: try another known route first.
+        if (wasKnownRoute)
+        {
+            nextRoutePlanTime = 0f;
+
+            if (TryFollowKnownRoute())
+                return;
+        }
 
         if (TryFindWaypoint())
             return;
@@ -1175,7 +1517,9 @@ public class Auto_movement : MonoBehaviour
         if (Application.isPlaying && hasWaypoint)
         {
             Gizmos.color =
-                state == NavigationState.Backtrack ? Color.red : Color.magenta;
+                state == NavigationState.Backtrack ? Color.red :
+                state == NavigationState.KnownRoute ? Color.cyan :
+                Color.magenta;
 
             Gizmos.DrawSphere(currentWaypoint, 0.2f);
             Gizmos.DrawLine(transform.position, currentWaypoint);
@@ -1183,6 +1527,25 @@ public class Auto_movement : MonoBehaviour
 
         if (!Application.isPlaying)
             return;
+
+        // Remembered route map (blue lines).
+        Gizmos.color = new Color(0.3f, 0.5f, 1f, 0.8f);
+
+        for (int i = 0; i < routeNodes.Count; i++)
+        {
+            RouteNode node = routeNodes[i];
+
+            if (!node.alive)
+                continue;
+
+            Gizmos.DrawSphere(node.pos, 0.1f);
+
+            foreach (int other in node.links)
+            {
+                if (other > i)
+                    Gizmos.DrawLine(node.pos, routeNodes[other].pos);
+            }
+        }
 
         float size = Mathf.Max(0.1f, memoryCellSize);
         Vector3 cube = new Vector3(size * 0.9f, 0.05f, size * 0.9f);
